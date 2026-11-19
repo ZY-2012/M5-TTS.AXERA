@@ -1,0 +1,21 @@
+M5-TTS.AXERA
+Copyright 2026 M5-TTS.AXERA contributors
+
+This product includes software and model weights derived from:
+
+* M5-TTS (ASLP-lab, NWPU / LycheeAI Lab)
+  https://github.com/ASLP-lab/M5-TTS
+  Model weights: https://huggingface.co/ASLP-lab/M5-TTS-50M-VoiceClone
+  License: Apache-2.0 (per the model card)
+
+* Qwen3-TTS 12 Hz speech tokenizer (Alibaba Qwen)
+  https://github.com/QwenLM/Qwen3-TTS
+  License: Apache-2.0 (see LICENSES/Qwen3-TTS-codec-Apache-2.0.txt)
+
+* Llama-3 tokenizer / RoPE conventions (Meta)
+  The tokenizer.json shipped with M5-TTS is a Llama-3 style byte-level BPE.
+
+* AXERA Pulsar2 / AX_ENGINE runtime (AXERA-TECH)
+  https://github.com/AXERA-TECH
+
+Quantization and AX650 deployment: Pulsar2 8.0 (installed via Magnetar).

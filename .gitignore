@@ -1,0 +1,5 @@
+models/*.axmodel
+models/assets/
+__pycache__/
+*.pyc
+out.wav
