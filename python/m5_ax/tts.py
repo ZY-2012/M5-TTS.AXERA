@@ -12,8 +12,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
+import os
 import time
 from pathlib import Path
 
@@ -42,7 +44,14 @@ class AxEngine:
         self.output_names = [o.name for o in self.sess.get_outputs()]
 
     def run(self, feed):
-        return self.sess.run(self.output_names, {k: np.ascontiguousarray(feed[k], np.float32) for k in self.input_names})
+        # keep integer index inputs (i0/i1) as int32; everything else fp32
+        out = {}
+        for k in self.input_names:
+            v = feed[k]
+            out[k] = (np.ascontiguousarray(v, np.int32)
+                      if np.issubdtype(np.asarray(v).dtype, np.integer)
+                      else np.ascontiguousarray(v, np.float32))
+        return self.sess.run(self.output_names, out)
 
 
 # ------------------------------------------------------------------ helpers
@@ -104,22 +113,32 @@ class M5AX:
                      "codec_encoder", "codec_decoder"):
             self.engines[name] = engine_cls(Path(model_dir) / f"{name}{suffix}")
         a = Path(assets_dir)
-        self.text_emb = np.load(a / "text_embeddings.npy", mmap_mode="r")
-        self.audio_emb = np.load(a / "audio_embeddings.npy", mmap_mode="r")
-        self.head0 = np.load(a / "head0.npy")
-        self.audio_head = np.load(a / "audio_head.npy")
+
+        def f32(name):
+            return np.asarray(np.load(a / name), np.float32)
+
+        # only the tables that still live on the host (int8 tables + per-row scales preferred)
+        def table(name):
+            if (a / f"{name}_i8.npy").is_file():
+                return self._q8_table(a, name, 512)
+            return f32(f"{name}.npy")
+        self.text_emb = table("text_embeddings")
+        self.audio_emb = table("audio_embeddings")
+        self.head0 = table("head0")
+        self.audio_head = (self._q8_table(a, "audio_head", 512)
+                           if (a / "audio_head_i8.npy").is_file()
+                           else np.ascontiguousarray(f32("audio_head.npy").transpose(0, 2, 1)))
+        self.proj_audio = (self._q8_table(a, "projected_audio", 512)
+                           if (a / "projected_audio_i8.npy").is_file()
+                           else np.asarray(self.audio_emb @ self.proj.T, np.float32))
+        self.evq_sem_w = f32("enc_sem_w.npy")
+        self.evq_ac_w = f32("enc_ac_w.npy")
+        self.evq_sem_book = f32("enc_sem_book.npy")
+        self.evq_ac_book = f32("enc_ac_book.npy")
         self.proj = np.load(a / "projection.npy")
         self.binv = np.load(a / "backbone_inv_freq.npy")
         self.dinv = np.load(a / "decoder_inv_freq.npy")
         self.cinv = np.load(a / "codec_inv_freq.npy")
-        zq = np.load(a / "codec_enc_vq.npz")
-        self.evq_sem_w, self.evq_ac_w = zq["enc_sem_w"], zq["enc_ac_w"]
-        self.evq_sem_book, self.evq_ac_book = zq["enc_sem_book"], zq["enc_ac_book"]
-        z = np.load(a / "codec_rvq.npz")
-        self.book_sem = z["book_sem"][0]
-        self.book_rest = z["book_rest"]
-        self.ps_w, self.ps_b = z["proj_sem_w"], z["proj_sem_b"]
-        self.pr_w, self.pr_b = z["proj_rest_w"], z["proj_rest_b"]
         meta = json.loads((a / "codec_meta.json").read_text())
         self.clayers = meta["codec_layers"]
         self.ckv = meta["codec_kv_heads"]
@@ -135,6 +154,7 @@ class M5AX:
         self._tables_ready = False
         self._ref_cache = {}
         self._prompt_cache = {}
+        self.prompt_cache_dir = Path(os.environ.get("M5_PROMPT_CACHE", "cache/py_ref"))
         prior_path = a / "codebook_prior.npy"
         code_path = a / "mean_code.npy"
         self.prior = np.load(prior_path) if prior_path.exists() else np.zeros((16, 512), np.float32)
@@ -155,14 +175,18 @@ class M5AX:
 
 
     # -------------------------------------------------------------- pieces
+    @staticmethod
+    def _q8_table(a, name, inner, transpose=None):
+        q = np.load(a / f"{name}_i8.npy")
+        shape = q.shape
+        data = q.reshape(-1, inner).astype(np.float32)
+        data *= np.load(a / f"{name}_scale.npy").astype(np.float32)[:, None]
+        data = data.reshape(shape)
+        if transpose is not None:
+            data = np.ascontiguousarray(np.transpose(data, transpose))
+        return data
+
     def _prepare_tables(self):
-        if self._tables_ready:
-            return
-        path = Path(self.assets_dir) / "projected_audio.npy"
-        if path.is_file():
-            self.proj_audio = np.load(path, mmap_mode="r")
-        else:  # fallback: project every audio embedding row, fp32 [16*2051, 512]
-            self.proj_audio = np.asarray(self.audio_emb @ self.proj.T, np.float32)
         self._tables_ready = True
 
     def _run(self, name, feed):
@@ -233,7 +257,7 @@ class M5AX:
         vals = vals - vals.max()
         np.exp(vals, out=vals)
         vals /= vals.sum()
-        pick = int(np.argmax(vals / noise[idx]))
+        pick = int(np.argmax(vals / noise))
         return int(idx[pick])
 
     def _head(self, h, level):
@@ -252,6 +276,37 @@ class M5AX:
         allowed = ((key_abs[None, :] <= pos_abs[:, None]) & (key_abs[None, :] >= 0) &
                    (key_abs[None, :] >= pos_abs[:, None] - (w - 1)))
         return np.where(allowed, 0.0, NEG).astype(np.float32)[None, None]
+
+    def _prompt_cache_path(self, key):
+        tag = hashlib.sha1(repr(key).encode()).hexdigest()[:16]
+        return self.prompt_cache_dir / f"{tag}.npz"
+
+    def _load_prompt_cache(self, key):
+        path = self._prompt_cache_path(key)
+        if not path.is_file():
+            return None
+        try:
+            z = np.load(path)
+            stream = self._CodecStream(self)
+            stream.past = z["past"]
+            stream.states = [z[f"state_{i}"] for i in range(len(self.cstates))]
+            stream.offset = int(z["offset"])
+            stream.pending = z["pending"]
+            return dict(codes=z["codes"], prefix=z["prefix"], stream=stream)
+        except Exception:  # noqa: BLE001 - stale cache is not fatal
+            return None
+
+    def _save_prompt_cache(self, key, codes, prefix, stream):
+        path = self._prompt_cache_path(key)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp.npz")
+        try:
+            np.savez(tmp, codes=codes, prefix=prefix, past=stream.past, offset=stream.offset,
+                     pending=stream.pending,
+                     **{f"state_{i}": st for i, st in enumerate(stream.states)})
+            tmp.replace(path)
+        except Exception:  # noqa: BLE001 - cache is best effort
+            pass
 
     # ----------------------------------------------------------- generation
     def warmup(self):
@@ -317,16 +372,19 @@ class M5AX:
         def _chunk(self, codes):
             tts = self.tts
             n = len(codes)
-            latent = tts.codec_latent(codes, keep=self.keep)[None]
-            chunk = np.zeros((1, 512, tts.cframes), np.float32)
-            chunk[:, :, :n] = latent
+            block = np.zeros((tts.cframes, 16), np.int64)
+            block[:n] = np.asarray(codes, np.int64)[:tts.cframes]
             off = self.offset
-            feed = {"latent": chunk, "past": self.past,
-                    "cos": tts.ccos[off:off + tts.cframes][None, None],
-                    "sin": tts.csin[off:off + tts.cframes][None, None],
-                    "mask": tts._codec_mask(off, tts.cframes)}
+            feed = {
+                "i0": block[:, 0].astype(np.int32)[None],
+                "i1": (block[:, 1:] + (np.arange(15, dtype=np.int32) * 2048)[None, :]
+                       ).reshape(1, -1).astype(np.int32),
+                "past": self.past,
+                "cos": tts.ccos[off:off + tts.cframes][None, None],
+                "sin": tts.csin[off:off + tts.cframes][None, None],
+                "mask": tts._codec_mask(off, tts.cframes)}
             for i, state in enumerate(self.states):
-                feed[f"conv_{i}"] = state
+                feed[f"state_{i}"] = state
             out = tts._run("codec_decoder", feed)
             self.past = out[1]
             self.states = out[2:]
@@ -334,6 +392,8 @@ class M5AX:
             return out[0].reshape(-1)[:n * tts.hop]
 
     def decode_codes(self, codes, keep=16):
+        if keep != 16:
+            raise NotImplementedError("all-NPU codec decoder takes all 16 codebooks")
         stream = self._CodecStream(self, keep=keep)
         return stream.push(codes, final=True)
 
@@ -350,6 +410,10 @@ class M5AX:
                 stat = Path(prompt_wav).stat()
                 key = (str(Path(prompt_wav).resolve()), stat.st_size, stat.st_mtime_ns, codebooks)
             entry = self._prompt_cache.get(key) if key is not None else None
+            if entry is None and key is not None:
+                entry = self._load_prompt_cache(key)
+                if entry is not None:
+                    self._prompt_cache[key] = entry
             if entry is not None:
                 prompt = entry["codes"].copy()
                 prefix = entry["prefix"].copy()
@@ -435,6 +499,7 @@ class M5AX:
                     if is_prompt and cache_key is not None:
                         self._prompt_cache[cache_key] = dict(
                             codes=prompt.copy(), prefix=prefix.copy(), stream=stream.clone())
+                        self._save_prompt_cache(cache_key, prompt, prefix, stream)
                 except Exception as error:  # noqa: BLE001 - surface to caller
                     errors.append(error)
                     break
@@ -450,6 +515,10 @@ class M5AX:
                 jobs.put((prompt, False, True))   # prompt context decoded in the background
         elif not warm:
             decode(prompt)                        # sequential warmup of the prompt context
+            if cache_key is not None:
+                self._prompt_cache[cache_key] = dict(
+                    codes=prompt.copy(), prefix=prefix.copy(), stream=stream.clone())
+                self._save_prompt_cache(cache_key, prompt, prefix, stream)
 
         def collect(wait_for_audio):
             out = []
@@ -484,23 +553,24 @@ class M5AX:
             frame = 0
             while frame < max_frames:
                 ta = time.perf_counter()
-                noise = rng.exponential(size=(16, self.cfg["audio_vocab"])).astype(np.float32)
-                np.maximum(noise, self.noise_tiny, out=noise)
-                c0 = self._sample(np.dot(self.head0, last), noise[0], frame > self.cfg["min_frames"], greedy=greedy)
+                c0 = self._sample(np.dot(self.head0, last), np.maximum(rng.exponential(size=10), self.noise_tiny),
+                                  frame > self.cfg["min_frames"], greedy=greedy)
                 local = np.empty((1, 2, self.cfg["hidden"]), np.float32)
                 np.dot(last, self.proj.T, out=local[0, 0])
-                np.dot(self.audio_emb[c0], self.proj.T, out=local[0, 1])
+                local[0, 1] = self.proj_audio[c0]
                 dh, dkv = self._run("depth_prefill", {"local": local})
                 depth_buf[:, :, :, :, :2] = dkv
                 h = dh[0]
                 codes = [c0]
                 for level in range(codebooks - 1):
-                    ci = self._sample(np.dot(h, self.audio_head[level]), noise[level + 1], True, greedy=greedy)
+                    ci = self._sample(self.audio_head[level] @ h, np.maximum(rng.exponential(size=10), self.noise_tiny), True,
+                                      greedy=greedy)
                     codes.append(ci)
                     if level == codebooks - 2:
                         break
                     token_pos = level + 2
-                    depth_feed["local"] = self.proj_audio[ci + (level + 1) * self.cfg["audio_vocab"]][None, None]
+                    depth_feed["local"] = self.proj_audio[
+                        ci + (level + 1) * self.cfg["audio_vocab"]][None, None]
                     depth_mask[...] = NEG
                     depth_mask[..., :token_pos] = 0.0
                     depth_mask[..., -1] = 0.0

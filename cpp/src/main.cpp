@@ -55,14 +55,31 @@ struct Args {
 };
 
 struct Assets {
-    ax::Npy text_emb, audio_emb, head0, ahead, proj, proj_audio;
+    ax::Npy text_emb, audio_emb, head0, ahead, proj;
     ax::Npy enc_sem_book, enc_ac_book, enc_sem_w, enc_ac_w;
-    ax::Npy dec_sem_book, dec_rest_book, dpsw, dpsb, dprw, dprb, prior, mean_code;
+    ax::Npy prior, mean_code;
     std::vector<float> bcos, bsin, dcos, dsin, ccos, csin;
 };
 
 static bool load_npy(const std::string& dir, const char* name, ax::Npy& out) {
     return ax::read_npy(dir + "/" + name, out);
+}
+
+// int8 table + one fp32 scale per `inner` consecutive values (runtime layout)
+static bool load_q8(const std::string& dir, const char* name, int inner, ax::Npy& out) {
+    ax::Npy q, s;
+    if (!ax::read_npy(dir + "/" + name + "_i8.npy", q)) return false;
+    if (!ax::read_npy(dir + "/" + name + "_scale.npy", s)) return false;
+    out.shape = q.shape;
+    out.data.resize(q.data.size());
+    const size_t groups = s.data.size();
+    const size_t step = static_cast<size_t>(inner);
+    for (size_t g = 0; g < groups; ++g) {
+        const float scale = s.data[g];
+        const size_t base = g * step;
+        for (size_t j = 0; j < step; ++j) out.data[base + j] = q.data[base + j] * scale;
+    }
+    return true;
 }
 
 static void rope_tables(const float* inv, float scale, int n, std::vector<float>& cos,
@@ -83,35 +100,19 @@ static void rope_tables(const float* inv, float scale, int n, std::vector<float>
 }
 
 static bool load_assets(const std::string& dir, Assets& a) {
-    bool ok = load_npy(dir, "text_embeddings.npy", a.text_emb) &&
-              load_npy(dir, "audio_embeddings.npy", a.audio_emb) &&
-              load_npy(dir, "head0.npy", a.head0) &&
-              load_npy(dir, "audio_head.npy", a.ahead) &&
-              load_npy(dir, "projection.npy", a.proj) &&
-              load_npy(dir, "projected_audio.npy", a.proj_audio) &&
+    // host tables: int8 + per-row scales; encoder codebooks are fp16
+    bool ok = load_q8(dir, "text_embeddings", 512, a.text_emb) &&
+              load_q8(dir, "audio_embeddings", 512, a.audio_emb) &&
+              load_q8(dir, "head0", 512, a.head0) &&
+              load_q8(dir, "audio_head", 512, a.ahead) &&   // already [15][vocab][dim]
               load_npy(dir, "enc_sem_book.npy", a.enc_sem_book) &&
               load_npy(dir, "enc_ac_book.npy", a.enc_ac_book) &&
+              load_npy(dir, "projection.npy", a.proj) &&
               load_npy(dir, "enc_sem_w.npy", a.enc_sem_w) &&
               load_npy(dir, "enc_ac_w.npy", a.enc_ac_w) &&
-              load_npy(dir, "dec_sem_book.npy", a.dec_sem_book) &&
-              load_npy(dir, "dec_rest_book.npy", a.dec_rest_book) &&
-              load_npy(dir, "dec_proj_sem_w.npy", a.dpsw) &&
-              load_npy(dir, "dec_proj_sem_b.npy", a.dpsb) &&
-              load_npy(dir, "dec_proj_rest_w.npy", a.dprw) &&
-              load_npy(dir, "dec_proj_rest_b.npy", a.dprb) &&
               load_npy(dir, "codebook_prior.npy", a.prior) &&
               load_npy(dir, "mean_code.npy", a.mean_code);
     if (!ok) return false;
-    // audio_head.npy is [15, 512, 2051] (dim-major); transpose for row-major GEMV
-    {
-        std::vector<float> t(static_cast<size_t>(15) * 512 * kAudioVocab);
-        for (int l = 0; l < 15; ++l)
-            for (int d = 0; d < 512; ++d)
-                for (int v = 0; v < kAudioVocab; ++v)
-                    t[(static_cast<size_t>(l) * kAudioVocab + v) * 512 + d] =
-                        a.ahead.data[(static_cast<size_t>(l) * 512 + d) * kAudioVocab + v];
-        a.ahead.data.swap(t);
-    }
     rope_tables(kBackboneInvFreq, kBackboneRopeScale, kCap + 8, a.bcos, a.bsin);
     rope_tables(kDecoderInvFreq, kDecoderRopeScale, kDepthSlots + 2, a.dcos, a.dsin);
     rope_tables(kCodecInvFreq, 1.f, 2048, a.ccos, a.csin);
@@ -213,30 +214,6 @@ static void rvq_encode(const Assets& a, const float* feat, int frames, int strid
     nearest(a.enc_sem_book.data.data(), 0);
     for (int q = 0; q < 15; ++q)
         nearest(a.enc_ac_book.data.data() + static_cast<size_t>(q) * 2048 * 256, q + 1);
-}
-
-// RVQ decode: codes [16][n] -> latent [512][n]
-static void rvq_decode(const Assets& a, const int* codes, int n, float* latent, int keep,
-                       const float* prior) {
-    std::vector<float> sem(256), rest(256);
-    for (int t = 0; t < n; ++t) {
-        const float* e = a.dec_sem_book.data.data() + static_cast<size_t>(codes[static_cast<size_t>(0) * n + t]) * 256;
-        for (int c = 0; c < 256; ++c) sem[c] = e[c];
-        std::fill(rest.begin(), rest.end(), 0.f);
-        for (int q = 0; q < keep - 1; ++q) {
-            const float* er = a.dec_rest_book.data.data() +
-                              (static_cast<size_t>(q) * 2048 + static_cast<size_t>(codes[static_cast<size_t>(q + 1) * n + t])) * 256;
-            for (int c = 0; c < 256; ++c) rest[c] += er[c];
-        }
-        for (int o = 0; o < 512; ++o) {
-            float v = a.dpsb.data[o] + a.dprb.data[o];
-            const float* ws = a.dpsw.data.data() + static_cast<size_t>(o) * 256;
-            const float* wr = a.dprw.data.data() + static_cast<size_t>(o) * 256;
-            float acc = 0.f;
-            for (int c = 0; c < 256; ++c) acc += ws[c] * sem[c] + wr[c] * rest[c];
-            latent[static_cast<size_t>(o) * n + t] = v + acc + (prior ? prior[o] : 0.f);
-        }
-    }
 }
 
 // ---------------------------------------------------------------- sampling
@@ -480,14 +457,14 @@ struct Pipeline {
     std::vector<float> prior_keep;
 
     void decode_block(const int* codes, int n, bool final_block, std::vector<float>& pcm) {
-        std::vector<float> latent(static_cast<size_t>(512) * kCodecFrames, 0.f);
-        std::vector<int> icodes(static_cast<size_t>(n) * 16);
-        for (int t = 0; t < n; ++t)
-            for (int cb = 0; cb < 16; ++cb) icodes[static_cast<size_t>(cb) * n + t] = codes[t * 16 + cb];
-        std::vector<float> full(static_cast<size_t>(512) * n);
-        rvq_decode(a, icodes.data(), n, full.data(), codebooks, prior_keep.data());
-        for (int c = 0; c < 512; ++c)
-            for (int t = 0; t < n; ++t) latent[static_cast<size_t>(c) * kCodecFrames + t] = full[static_cast<size_t>(c) * n + t];
+        // i0 [8] = codebook 0; i1 [8*15] = (level-1)*2048 + code, frame-major
+        std::vector<int32_t> i0(kCodecFrames, 0);
+        std::vector<int32_t> i1(static_cast<size_t>(15) * kCodecFrames, 0);
+        for (int t = 0; t < n; ++t) {
+            i0[t] = codes[t * 16 + 0];
+            for (int q = 1; q < 16; ++q)
+                i1[static_cast<size_t>(t) * 15 + (q - 1)] = codes[t * 16 + q] + (q - 1) * 2048;
+        }
         std::vector<float> mask(static_cast<size_t>(kCodecFrames) * (kWindow - 1 + kCodecFrames));
         for (int t = 0; t < kCodecFrames; ++t) {
             const int pos = codec_offset + t;
@@ -502,17 +479,18 @@ struct Pipeline {
             std::memcpy(&cos[static_cast<size_t>(t) * 64], &a.ccos[static_cast<size_t>(codec_offset + t) * 64], 64 * sizeof(float));
             std::memcpy(&sin[static_cast<size_t>(t) * 64], &a.csin[static_cast<size_t>(codec_offset + t) * 64], 64 * sizeof(float));
         }
-        dec_model.set("latent", latent);
+        dec_model.set("i0", reinterpret_cast<const float*>(i0.data()), i0.size());
+        dec_model.set("i1", reinterpret_cast<const float*>(i1.data()), i1.size());
         dec_model.set("past", codec_past);
         dec_model.set("cos", cos);
         dec_model.set("sin", sin);
         dec_model.set("mask", mask);
-        for (int i = 0; i < kCodecStates; ++i) dec_model.set("conv_" + std::to_string(i), codec_states[i]);
+        for (int i = 0; i < kCodecStates; ++i) dec_model.set("state_" + std::to_string(i), codec_states[i]);
         if (!dec_model.run()) return;
-        dec_model.get("past_out", codec_past.data(), codec_past.size());
-        for (int i = 0; i < kCodecStates; ++i) dec_model.get("conv_out_" + std::to_string(i), codec_states[i].data(), codec_states[i].size());
+        dec_model.get("present", codec_past.data(), codec_past.size());
+        for (int i = 0; i < kCodecStates; ++i) dec_model.get("conv_" + std::to_string(i), codec_states[i].data(), codec_states[i].size());
         std::vector<float> audio(static_cast<size_t>(kCodecFrames) * kHop);
-        dec_model.get("audio", audio.data(), audio.size());
+        dec_model.get("wav", audio.data(), audio.size());
         pcm.assign(audio.begin(), audio.begin() + static_cast<size_t>(n) * kHop);
         codec_offset += n;
     }
@@ -537,7 +515,9 @@ struct Pipeline {
     // ------------------------------------------------------------ generate
     bool run() {
         const auto t_start = std::chrono::steady_clock::now();
-        codebooks = std::max(1, std::min(16, args.codebooks));
+        codebooks = 16;
+        if (args.codebooks != 16)
+            std::fprintf(stderr, "warning: all-NPU codec decoder needs 16 codebooks (got %d)\n", args.codebooks);
         std::fill(prior_keep.begin(), prior_keep.end(), 0.f);
         for (int q = codebooks; q < 16; ++q)
             for (int c = 0; c < 512; ++c) prior_keep[c] += a.prior.data[static_cast<size_t>(q) * 512 + c];
@@ -732,8 +712,9 @@ struct Pipeline {
                 codes[level + 1] = ci;
                 if (level == codebooks - 2) break;
                 const int token_pos = level + 2;
-                std::memcpy(&dlocal[0], &a.proj_audio.data[static_cast<size_t>(ci + (level + 1) * kAudioVocab) * kHidden],
-                            kHidden * sizeof(float));
+                matvec(a.proj.data.data(), kHidden, kHidden,
+                       &a.audio_emb.data[static_cast<size_t>(ci + (level + 1) * kAudioVocab) * kHidden],
+                       &dlocal[0]);
                 std::fill(depth_mask.begin(), depth_mask.end(), -30.f);
                 for (int i = 0; i < token_pos; ++i) depth_mask[i] = 0.f;
                 depth_mask[kDepthSlots] = 0.f;

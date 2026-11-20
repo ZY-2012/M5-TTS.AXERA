@@ -59,3 +59,19 @@ python model_convert/prepare_compile.py --models depth_step --run
 - `compiler.check=0`（全部上板验证）
 
 产物在 `compile/*.axmodel`，日志 `compile/logs/`。
+
+## 4. all-NPU 量化（int8 host 表 + 图内 RVQ）
+
+在上面的 6 个 FP32 图基础上，把 codec 解码的 RVQ 搬进图、host 表压成 int8/fp16：
+
+```bash
+python model_convert/allnpu/export_allnpu.py          # 新 codec_decoder（codes -> wav）
+python model_convert/quantize_assets.py               # int8 host 表 + fp16 编码码本
+python model_convert/allnpu/prepare_compile.py --run  # Pulsar2 编译
+```
+
+- codec decoder 输入改为 `i0[1,8]`（codebook 0）+ `i1[1,120]`（level 1..15，8 帧），
+  图内 2 个 FP16 码本 Gather + 投影，替代 host 的 RVQ 求和。
+- 文本/音频/head0/audio_head 存 int8（每行 scale），`projected_audio` 删除，
+  包体积 899 MB → 426 MB。
+- 音频头保持 host 计算：S8 头 + U16 logits 在 greedy 下不稳定（详见 docs/feasibility.md）。

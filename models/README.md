@@ -4,6 +4,9 @@ The 6 axmodels and the host assets are published on HuggingFace:
 
     https://huggingface.co/HY-2012/M5-TTS.AXERA
 
+`assets/` 里的 host 表为 **int8 + 每行 scale**（文本/音频/head0/audio_head）和 **fp16**
+（codec 编码码本），运行时加载阶段反量化；`projected_audio` 与 codec 解码 RVQ 表已不再需要。
+
 Download the `models/` directory from that repository into this directory
 (`models/` next to `bin/`, `python/`, `samples/`), or convert them yourself with
 `model_convert/` (see `model_convert/README.md`).
@@ -15,5 +18,5 @@ Download the `models/` directory from that repository into this directory
 | `depth_prefill.axmodel` | 21 MB | first 2 local tokens |
 | `depth_step.axmodel` | 21 MB | one codebook position |
 | `codec_encoder.axmodel` | 44 MB | 4.8 s reference -> [512,60] features |
-| `codec_decoder.axmodel` | 116 MB | 8 latent frames -> 15360 samples |
-| `assets/` | 530 MB | embeddings, heads, RVQ tables, tokenizer |
+| `codec_decoder.axmodel` | 133 MB | 8 frames of codes -> 15360 samples（RVQ 解码在图内） |
+| `assets/` | 159 MB | int8/fp16 embeddings、heads、codec 编码码本、tokenizer |

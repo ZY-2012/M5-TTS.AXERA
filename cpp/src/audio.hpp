@@ -257,6 +257,10 @@ static inline bool read_npy(const std::string& path, Npy& out) {
     out.data.resize(count);
     if (descr == "<f4" || descr == "|f4" || descr == "=f4") {
         std::fread(out.data.data(), 4, count, f);
+    } else if (descr == "|i1" || descr == "<i1" || descr == "=i1" || descr == ">i1") {
+        std::vector<int8_t> q(count);
+        std::fread(q.data(), 1, count, f);
+        for (size_t i = 0; i < count; ++i) out.data[i] = static_cast<float>(q[i]);
     } else if (descr == "<f2") {
         std::vector<uint16_t> h(count);
         std::fread(h.data(), 2, count, f);
