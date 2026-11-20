@@ -1,8 +1,11 @@
 # Models
 
+> 本分支为 **全 NPU2** 版本：6 个 axmodel 均按 `npu_mode=NPU2` 编译；模型从 HuggingFace 的 `npu2` 分支下载。
+> 标准版（LM/depth NPU1 + codec NPU3）在 `main` 分支。
+
 The 6 axmodels and the host assets are published on HuggingFace:
 
-    https://huggingface.co/HY-2012/M5-TTS.AXERA
+    https://huggingface.co/HY-2012/M5-TTS.AXERA/tree/npu2
 
 `assets/` 里的 host 表为 **int8 + 每行 scale**（文本/音频/head0/audio_head）和 **fp16**
 （codec 编码码本），运行时加载阶段反量化；`projected_audio` 与 codec 解码 RVQ 表已不再需要。
