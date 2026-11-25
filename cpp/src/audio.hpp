@@ -209,6 +209,63 @@ struct Npy {
     std::vector<float> data;
 };
 
+static inline bool read_npy_i8(const std::string& path, std::vector<int8_t>& out,
+                               std::vector<size_t>* shape_out = nullptr) {
+    FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) {
+        std::fprintf(stderr, "cannot open npy %s\n", path.c_str());
+        return false;
+    }
+    char magic[6];
+    if (std::fread(magic, 1, 6, f) != 6 || std::memcmp(magic, "\x93NUMPY", 6)) {
+        std::fclose(f);
+        return false;
+    }
+    uint8_t major = 0, minor = 0;
+    std::fread(&major, 1, 1, f); std::fread(&minor, 1, 1, f);
+    uint32_t hlen = 0;
+    if (major == 1) {
+        uint16_t h = 0; std::fread(&h, 2, 1, f); hlen = h;
+    } else {
+        std::fread(&hlen, 4, 1, f);
+    }
+    std::string header(hlen, '\0');
+    std::fread(&header[0], 1, hlen, f);
+    std::string descr;
+    size_t pos = header.find("descr");
+    if (pos != std::string::npos) {
+        size_t colon = header.find(':', pos);
+        size_t q1 = header.find('\'', colon), q2 = header.find('\'', q1 + 1);
+        if (q1 != std::string::npos && q2 != std::string::npos) descr = header.substr(q1 + 1, q2 - q1 - 1);
+    }
+    std::vector<size_t> shape;
+    pos = header.find("shape");
+    if (pos != std::string::npos) {
+        size_t q1 = header.find('(', pos), q2 = header.find(')', q1);
+        std::string s = header.substr(q1 + 1, q2 - q1 - 1);
+        size_t i = 0;
+        while (i < s.size()) {
+            while (i < s.size() && !std::isdigit((unsigned char)s[i])) ++i;
+            if (i >= s.size()) break;
+            size_t v = 0;
+            while (i < s.size() && std::isdigit((unsigned char)s[i])) v = v * 10 + (s[i++] - '0');
+            shape.push_back(v);
+        }
+    }
+    size_t count = 1;
+    for (auto v : shape) count *= v;
+    if (!(descr == "|i1" || descr == "<i1" || descr == "=i1" || descr == ">i1")) {
+        std::fprintf(stderr, "not int8 npy: %s (%s)\n", path.c_str(), descr.c_str());
+        std::fclose(f);
+        return false;
+    }
+    out.resize(count);
+    const bool ok = std::fread(out.data(), 1, count, f) == count;
+    std::fclose(f);
+    if (ok && shape_out) *shape_out = shape;
+    return ok;
+}
+
 static inline bool read_npy(const std::string& path, Npy& out) {
     FILE* f = std::fopen(path.c_str(), "rb");
     if (!f) {

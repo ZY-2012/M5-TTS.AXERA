@@ -3,7 +3,11 @@
 纯 C++17，无 Python/numpy 依赖：WAV 读写、重采样、去静音、byte-level BPE
 （`models/assets/tokenizer.bin`）、embedding / 15 个音频头 / top-k 采样、KV cache、
 流式 codec 解码。codec 的 RVQ 解码（16 码本 Gather + 投影）已并入 axmodel，
-host 端只传 16 个码字；host 表为 int8/fp16，载入时反量化。
+host 端只传 16 个码字；host 表为 int8/fp16。
+
+音频头 / head0 以 **int8** 常驻内存（15.7 / 1.1 MB），GEMV 用
+`#pragma omp simd reduction` 向量化；`projected_audio` 用 int8 查表，
+避免每帧 16 次 512×512 fp32 投影。单帧 host 头表读取从 63 MB 降到 15.7 MB。
 
 ## 编译
 

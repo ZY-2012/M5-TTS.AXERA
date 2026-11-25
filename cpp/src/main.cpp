@@ -55,7 +55,13 @@ struct Args {
 };
 
 struct Assets {
-    ax::Npy text_emb, audio_emb, head0, ahead, proj;
+    ax::Npy text_emb, audio_emb, proj;
+    std::vector<int8_t> head0_i8;        // [vocab][dim] int8
+    ax::Npy head0_scale;                 // [vocab]
+    std::vector<int8_t> ahead_i8;        // [15][vocab][dim] int8, kept quantized
+    ax::Npy ahead_scale;                 // [15*vocab]
+    std::vector<int8_t> proj_audio_i8;   // [16*vocab][dim] int8
+    ax::Npy proj_audio_scale;            // [16*vocab]
     ax::Npy enc_sem_book, enc_ac_book, enc_sem_w, enc_ac_w;
     ax::Npy prior, mean_code;
     std::vector<float> bcos, bsin, dcos, dsin, ccos, csin;
@@ -103,8 +109,12 @@ static bool load_assets(const std::string& dir, Assets& a) {
     // host tables: int8 + per-row scales; encoder codebooks are fp16
     bool ok = load_q8(dir, "text_embeddings", 512, a.text_emb) &&
               load_q8(dir, "audio_embeddings", 512, a.audio_emb) &&
-              load_q8(dir, "head0", 512, a.head0) &&
-              load_q8(dir, "audio_head", 512, a.ahead) &&   // already [15][vocab][dim]
+              ax::read_npy_i8(dir + "/head0_i8.npy", a.head0_i8) &&
+              load_npy(dir, "head0_scale.npy", a.head0_scale) &&
+              ax::read_npy_i8(dir + "/audio_head_i8.npy", a.ahead_i8) &&
+              load_npy(dir, "audio_head_scale.npy", a.ahead_scale) &&
+              ax::read_npy_i8(dir + "/projected_audio_i8.npy", a.proj_audio_i8) &&
+              load_npy(dir, "projected_audio_scale.npy", a.proj_audio_scale) &&
               load_npy(dir, "enc_sem_book.npy", a.enc_sem_book) &&
               load_npy(dir, "enc_ac_book.npy", a.enc_ac_book) &&
               load_npy(dir, "projection.npy", a.proj) &&
@@ -113,6 +123,15 @@ static bool load_assets(const std::string& dir, Assets& a) {
               load_npy(dir, "codebook_prior.npy", a.prior) &&
               load_npy(dir, "mean_code.npy", a.mean_code);
     if (!ok) return false;
+    if (a.head0_i8.size() != static_cast<size_t>(kAudioVocab) * kHidden ||
+        a.head0_scale.data.size() != static_cast<size_t>(kAudioVocab) ||
+        a.ahead_i8.size() != static_cast<size_t>(15) * kAudioVocab * kHidden ||
+        a.ahead_scale.data.size() != static_cast<size_t>(15) * kAudioVocab ||
+        a.proj_audio_i8.size() != static_cast<size_t>(16) * kAudioVocab * kHidden ||
+        a.proj_audio_scale.data.size() != static_cast<size_t>(16) * kAudioVocab) {
+        std::fprintf(stderr, "int8 head/projection tables have unexpected sizes\n");
+        return false;
+    }
     rope_tables(kBackboneInvFreq, kBackboneRopeScale, kCap + 8, a.bcos, a.bsin);
     rope_tables(kDecoderInvFreq, kDecoderRopeScale, kDepthSlots + 2, a.dcos, a.dsin);
     rope_tables(kCodecInvFreq, 1.f, 2048, a.ccos, a.csin);
@@ -125,9 +144,27 @@ static void matvec(const float* W, int rows, int cols, const float* x, float* y)
     for (int r = 0; r < rows; ++r) {
         const float* row = W + static_cast<size_t>(r) * cols;
         float acc = 0.f;
+#pragma omp simd reduction(+:acc)
         for (int c = 0; c < cols; ++c) acc += row[c] * x[c];
         y[r] = acc;
     }
+}
+
+// int8 weights with one scale per output row (the 63 MB fp32 table is gone)
+static void matvec_s8(const int8_t* W, const float* scale, int rows, int cols,
+                      const float* x, float* y) {
+#pragma omp parallel for schedule(static)
+    for (int r = 0; r < rows; ++r) {
+        const int8_t* row = W + static_cast<size_t>(r) * cols;
+        float acc = 0.f;
+#pragma omp simd reduction(+:acc)
+        for (int c = 0; c < cols; ++c) acc += static_cast<float>(row[c]) * x[c];
+        y[r] = acc * scale[r];
+    }
+}
+
+static void dequant_row(const int8_t* src, float scale, int n, float* dst) {
+    for (int i = 0; i < n; ++i) dst[i] = static_cast<float>(src[i]) * scale;
 }
 
 static void add_row(float* dst, const float* src, int n) {
@@ -685,12 +722,14 @@ struct Pipeline {
                 for (int i = 0; i < 16; ++i)
                     for (int j = 0; j < kAudioVocab; ++j) noise[static_cast<size_t>(i) * kAudioVocab + j] = rng.exponential();
             std::vector<float> logits(kAudioVocab);
-            matvec(a.head0.data.data(), kAudioVocab, kHidden, last.data(), logits.data());
+            matvec_s8(a.head0_i8.data(), a.head0_scale.data.data(),
+                      kAudioVocab, kHidden, last.data(), logits.data());
             const int c0 = sample(logits.data(), &noise[0], frame > kMinFrames, args.greedy, idx, vals);
             std::vector<int> codes(16, 0);
             codes[0] = c0;
             matvec(a.proj.data.data(), kHidden, kHidden, last.data(), &dlocal[0]);
-            matvec(a.proj.data.data(), kHidden, kHidden, &a.audio_emb.data[static_cast<size_t>(c0) * kHidden], &dlocal[kHidden]);
+            dequant_row(a.proj_audio_i8.data() + static_cast<size_t>(c0) * kHidden,
+                        a.proj_audio_scale.data[c0], kHidden, &dlocal[kHidden]);
             depth_pre_model.set("local", dlocal);
             if (!depth_pre_model.run()) return false;
             std::vector<float> dh(kHidden);
@@ -705,16 +744,17 @@ struct Pipeline {
                                     2 * 64 * sizeof(float));
             std::vector<float> h = dh;
             for (int level = 0; level < codebooks - 1; ++level) {
-                matvec(a.ahead.data.data() + static_cast<size_t>(level) * kAudioVocab * kHidden,
-                       kAudioVocab, kHidden, h.data(), logits.data());
+                matvec_s8(a.ahead_i8.data() + static_cast<size_t>(level) * kAudioVocab * kHidden,
+                          a.ahead_scale.data.data() + static_cast<size_t>(level) * kAudioVocab,
+                          kAudioVocab, kHidden, h.data(), logits.data());
                 const int ci = sample(logits.data(), &noise[static_cast<size_t>(level + 1) * kAudioVocab], true,
                                       args.greedy, idx, vals);
                 codes[level + 1] = ci;
                 if (level == codebooks - 2) break;
                 const int token_pos = level + 2;
-                matvec(a.proj.data.data(), kHidden, kHidden,
-                       &a.audio_emb.data[static_cast<size_t>(ci + (level + 1) * kAudioVocab) * kHidden],
-                       &dlocal[0]);
+                const size_t pa = static_cast<size_t>(ci + (level + 1) * kAudioVocab);
+                dequant_row(a.proj_audio_i8.data() + pa * kHidden,
+                            a.proj_audio_scale.data[pa], kHidden, &dlocal[0]);
                 std::fill(depth_mask.begin(), depth_mask.end(), -30.f);
                 for (int i = 0; i < token_pos; ++i) depth_mask[i] = 0.f;
                 depth_mask[kDepthSlots] = 0.f;
