@@ -2,18 +2,21 @@
 
 ### 50M 参数 · 实时流式 · 六语言 + 方言 · zero-shot 音色克隆
 
-![RTF](https://img.shields.io/badge/RTF-0.55--0.66-brightgreen) ![TTFA](https://img.shields.io/badge/TTFA-0.41%20s-blue) ![TTFT](https://img.shields.io/badge/TTFT-0.07%20s-lightgrey) ![语言](https://img.shields.io/badge/%E8%AF%AD%E8%A8%80-zh%20%2F%20en%20%2F%20de%20%2F%20fr%20%2F%20ja%20%2F%20ko-blueviolet) ![SampleRate](https://img.shields.io/badge/audio-24%20kHz-blue)
+![RTF](https://img.shields.io/badge/RTF-0.59--0.78-brightgreen) ![TTFA](https://img.shields.io/badge/TTFA-0.44%20s-blue) ![TTFT](https://img.shields.io/badge/TTFT-0.07%20s-lightgrey) ![语言](https://img.shields.io/badge/%E8%AF%AD%E8%A8%80-zh%20%2F%20en%20%2F%20de%20%2F%20fr%20%2F%20ja%20%2F%20ko-blueviolet) ![SampleRate](https://img.shields.io/badge/audio-24%20kHz-blue)
 
 | 项目 | 说明 |
 |---|---|
 | **支持语言** | **中文、英语、德语、法语、日语、韩语**（中/英已上板验证） |
-| **推理方式** | C++ / Python，6 个 axmodel（NPU）+ int8 host 表，流式（0.64 s 一包）+ 非流式 |
-| **首包时延** | TTFA **0.41 s**、首帧 TTFT 0.07 s（参考音色缓存命中） |
-| **实时率** | RTF **0.55–0.66**（C++，3–9 s 句）· 0.85–0.98（Python，缓存命中–首次） |
-| **模型体积** | **443 MB**（axmodels 284 MB + int8/fp16 host 表 159 MB） |
+| **推理方式** | C++ / Python，6 个 axmodel 全 NPU1（占 1 核）+ int8 host 表，流式（0.64 s 一包）+ 非流式 |
+| **首包时延** | TTFA **0.44 s**、首帧 TTFT 0.07 s（参考音色缓存命中） |
+| **实时率** | RTF **0.59–0.78**（C++，3–9 s 句）· 0.93–1.14（Python，缓存命中–首次） |
+| **模型体积** | **442 MB**（axmodels 283 MB + int8/fp16 host 表 159 MB） |
 
-- HuggingFace（预编译模型 + SDK）: https://huggingface.co/HY-2012/M5-TTS.AXERA
-- GitHub（源码 + 转换脚本 + C++）: https://github.com/ZY-2012/M5-TTS.AXERA
+> 本分支为 **全 NPU1** 版本：6 个 axmodel 均按 `npu_mode=NPU1` 编译（每个占 1 个 NPU 核，最多可 3 个模型并行）。
+> ASR 与 `main` 一致；codec 因 NPU1 tiling 不同存在波形级数值差异。RTF 0.59–0.78（C++）。
+
+- HuggingFace（npu1 分支的预编译模型）: https://huggingface.co/HY-2012/M5-TTS.AXERA/tree/npu1
+- 本分支（全 NPU1）: https://github.com/ZY-2012/M5-TTS.AXERA/tree/npu1
 - 原始模型: https://huggingface.co/ASLP-lab/M5-TTS-50M-VoiceClone
 - 语音 codec: https://huggingface.co/ASLP-lab/M5-TTS-Audio-Tokenizer
 - 旧版（fp32，899 MB，RTF 0.48–0.58）：[`v1-fp32` 分支](https://github.com/ZY-2012/M5-TTS.AXERA/tree/v1-fp32)
@@ -89,12 +92,12 @@ print(tts.last_timing)   # TTFT / TTFA / RTF
 
 | 模式 | 实现 | 音频 | TTFT（首帧） | TTFA（首音频） | 总耗时 | RTF（耗时/音频） | 出包间隔 |
 |---|---|---|---|---|---|---|---|
-| **流式** | C++ | 3.52 s | 0.07–0.41 s | **0.41–0.76 s** | 1.96–2.33 s | **0.55–0.66** | 0.64 s（首包 0.40 s） |
-| **流式** | Python | 3.04 s | 0.17–0.40 s | 0.67–1.05 s | 2.57–2.97 s | 0.85–0.98 | 0.64 s（首包 0.72 s） |
-| 非流式 | C++ | 3.52 s | 0.07–0.43 s | — | 2.08–2.35 s | 0.59–0.66 | — |
-| 非流式 | Python | 3.04 s | 0.17–0.40 s | — | 2.57–2.97 s | 0.85–0.98 | — |
+| **流式** | C++ | 3.52 s | 0.07–0.59 s | **0.44–1.02 s** | 2.13–2.74 s | **0.61–0.78** | 0.64 s（首包 0.40 s） |
+| **流式** | Python | 3.04 s | 0.17–0.20 s | 0.73–0.74 s | 2.83–3.47 s | 0.93–1.14 | 0.64 s（首包 0.72 s） |
+| 非流式 | C++ | 3.52 s | 0.07–0.59 s | — | 2.13–2.74 s | 0.61–0.78 | — |
+| 非流式 | Python | 3.04 s | 0.17–0.20 s | — | 2.83–3.47 s | 0.93–1.14 | — |
 
-> 区间为“同一参考音色：缓存命中 – 首次”。C++ 长句（8.72 s，缓存）：TTFA 0.41 s、总耗时 4.77 s、RTF 0.55。
+> 区间为“同一参考音色：缓存命中 – 首次”。C++ 长句（8.72 s，缓存）：TTFA 0.45 s、总耗时 5.16–5.23 s、RTF 0.59–0.60。
 
 <a id="tree"></a>
 

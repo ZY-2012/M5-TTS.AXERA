@@ -75,3 +75,13 @@ python model_convert/allnpu/prepare_compile.py --run  # Pulsar2 编译
 - 文本/音频/head0/audio_head 存 int8（每行 scale），`projected_audio` 删除，
   包体积 899 MB → 426 MB。
 - 音频头保持 host 计算：S8 头 + U16 logits 在 greedy 下不稳定（详见 docs/feasibility.md）。
+
+## 6. NPU1 变体
+
+把 6 个图的 `npu_mode` 全部改为 `NPU1` 后重编（量化配置不变）：
+
+- LM/depth 的 4 个 config 本来就是 NPU1，可直接复用；
+- 只需重编 `codec_encoder` / `codec_decoder`（`allnpu/pulsar2_config_codec_decoder.json` + 基础 codec config）。
+
+每个模型固定占 1 个 NPU 核，最多可 3 个模型并行。C++ RTF 0.59–0.78；
+codec 因 NPU1 tiling 与 main 存在波形级数值差异，ASR 一致。
