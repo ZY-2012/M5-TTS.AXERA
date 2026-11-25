@@ -1,6 +1,7 @@
 #pragma once
 // Minimal AX650 AX_ENGINE wrapper: N float32 inputs / M float32 outputs, name based.
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <map>
@@ -22,7 +23,8 @@ inline bool ax_runtime_init() {
     }
     AX_ENGINE_NPU_ATTR_T attr;
     std::memset(&attr, 0, sizeof(attr));
-    attr.eHardMode = AX_ENGINE_VIRTUAL_NPU_DISABLE;
+    // Match the voice chain: 2 BIG + 1 LITTLE VNPU partition.
+    attr.eHardMode = AX_ENGINE_VIRTUAL_NPU_BIG_LITTLE;
     if (AX_ENGINE_Init(&attr) != 0) {
         std::fprintf(stderr, "AX_ENGINE_Init failed\n");
         return false;
@@ -62,6 +64,21 @@ public:
         if (AX_ENGINE_CreateContextV2(handle_, &context_) != 0 || !context_) {
             std::fprintf(stderr, "AX_ENGINE_CreateContextV2 failed: %s\n", path.c_str());
             return false;
+        }
+        // BIG_LITTLE partitions: 0x1 = BIG (2 cores, ASR/LLM), 0x2 = LITTLE (1 core, TTS).
+        // Override with M5_NPU_MASK=0x1 / 0x2 / 0 (disable pinning).
+        {
+            const char* env = std::getenv("M5_NPU_MASK");
+            const AX_U32 mask = env ? static_cast<AX_U32>(std::strtoul(env, nullptr, 0)) : 0x2u;
+            if (mask) {
+                const AX_S32 rc = AX_ENGINE_SetAffinity(handle_, mask);
+                AX_ENGINE_NPU_SET_T got = 0;
+                AX_ENGINE_GetAffinity(handle_, &got);
+                std::fprintf(stderr, "npu mode=BIG_LITTLE affinity set=0x%x rc=%d got=0x%x\n",
+                             static_cast<unsigned>(mask), rc, static_cast<unsigned>(got));
+                if (rc != 0)
+                    std::fprintf(stderr, "warning: AX_ENGINE_SetAffinity failed, running on default partition\n");
+            }
         }
         if (AX_ENGINE_GetIOInfo(handle_, &info_) != 0 || !info_) {
             std::fprintf(stderr, "AX_ENGINE_GetIOInfo failed: %s\n", path.c_str());

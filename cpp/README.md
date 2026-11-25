@@ -9,6 +9,10 @@ host 端只传 16 个码字；host 表为 int8/fp16。
 `#pragma omp simd reduction` 向量化；`projected_audio` 用 int8 查表，
 避免每帧 16 次 512×512 fp32 投影。单帧 host 头表读取从 63 MB 降到 15.7 MB。
 
+默认初始化 `AX_ENGINE_VIRTUAL_NPU_BIG_LITTLE`，并对每个模型调用
+`AX_ENGINE_SetAffinity(0x2)`，固定到 LITTLE 单核（语音链路分配给 TTS 的分区）；
+`M5_NPU_MASK=0x1` 可切到 BIG 双核分区，`M5_NPU_MASK=0` 关闭绑核。
+
 ## 编译
 
 交叉编译（推荐，与 BSP 版本一致）：
